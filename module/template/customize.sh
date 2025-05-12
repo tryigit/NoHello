@@ -24,6 +24,7 @@ else
 fi
 
 VERSION=$(grep_prop version "${TMPDIR}/module.prop")
+DESCRIPTION=$(grep_prop description "${TMPDIR}/module.prop")
 ui_print "- Installing $SONAME $VERSION"
 
 # check architecture
@@ -57,6 +58,8 @@ ui_print "- Extracting module files"
 extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
+extract "$ZIPFILE" 'cleanup.sh'      "$MODPATH"
+echo $DESCRIPTION > $MODPATH/description
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
 HAS32BIT=false && ([ $(getprop ro.product.cpu.abilist32) ] || [ $(getprop ro.system.product.cpu.abilist32) ]) && HAS32BIT=true

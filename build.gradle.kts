@@ -15,13 +15,26 @@ fun String.execute(currentWorkingDir: File = file("./")): String {
     return String(byteOut.toByteArray()).trim()
 }
 
+val localProperties by extra(java.util.Properties())
+val localPropertiesFile = file("local.properties")
+if (localPropertiesFile.exists()) {
+    localProperties.load(localPropertiesFile.inputStream())
+}
+
+val sdkDir: String by extra(
+    localProperties.getProperty("sdk.dir")
+        ?: System.getenv("ANDROID_HOME")
+        ?: System.getenv("ANDROID_SDK_ROOT")
+        ?: ""
+)
+
 val gitCommitCount = "git rev-list HEAD --count".execute().toInt()
 val gitCommitHash = "git rev-parse --verify --short HEAD".execute()
 
 // also the soname
-val moduleId by extra("sample")
-val moduleName by extra("Zygisk Module Sample")
-val verName by extra("v1")
+val moduleId by extra("zygisk_nohello")
+val moduleName by extra("Nohello")
+val verName by extra("v0.0.1")
 val verCode by extra(gitCommitCount)
 val commitHash by extra(gitCommitHash)
 val abiList by extra(listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64"))
@@ -40,7 +53,7 @@ tasks.register("Delete", Delete::class) {
 
 fun Project.configureBaseExtension() {
     extensions.findByType(AppExtension::class)?.run {
-        namespace = "io.github.a13e300.zygisk.module.sample"
+        namespace = "io.github.mhmrdd.zygisk.module.nohello"
         compileSdkVersion(androidCompileSdkVersion)
         ndkVersion = androidCompileNdkVersion
         buildToolsVersion = androidBuildToolsVersion

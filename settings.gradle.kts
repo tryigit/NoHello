@@ -14,7 +14,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Sample"
+rootProject.name = "NoHello"
 include(
     ":module"
 )

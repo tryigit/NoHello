@@ -7,6 +7,7 @@ plugins {
     alias(libs.plugins.agp.app)
 }
 
+val sdkDir: String by rootProject.extra
 val moduleId: String by rootProject.extra
 val moduleName: String by rootProject.extra
 val verCode: Int by rootProject.extra
@@ -45,6 +46,8 @@ android {
         }
     }
 }
+
+val adbPath = "$sdkDir/platform-tools/adb"
 
 androidComponents.onVariants { variant ->
     afterEvaluate {
@@ -124,14 +127,14 @@ androidComponents.onVariants { variant ->
         val pushTask = task<Exec>("push$variantCapped") {
             group = "module"
             dependsOn(zipTask)
-            commandLine("adb", "push", zipTask.outputs.files.singleFile.path, "/data/local/tmp")
+            commandLine(adbPath, "push", zipTask.outputs.files.singleFile.path, "/data/local/tmp")
         }
 
         val installKsuTask = task<Exec>("installKsu$variantCapped") {
             group = "module"
             dependsOn(pushTask)
             commandLine(
-                "adb", "shell", "su", "-c",
+                adbPath, "shell", "su", "-c",
                 "/data/adb/ksud module install /data/local/tmp/$zipFileName"
             )
         }
@@ -140,7 +143,7 @@ androidComponents.onVariants { variant ->
             group = "module"
             dependsOn(pushTask)
             commandLine(
-                "adb",
+                adbPath,
                 "shell",
                 "su",
                 "-M",
@@ -152,13 +155,13 @@ androidComponents.onVariants { variant ->
         task<Exec>("installKsuAndReboot$variantCapped") {
             group = "module"
             dependsOn(installKsuTask)
-            commandLine("adb", "reboot")
+            commandLine(adbPath, "reboot")
         }
 
         task<Exec>("installMagiskAndReboot$variantCapped") {
             group = "module"
             dependsOn(installMagiskTask)
-            commandLine("adb", "reboot")
+            commandLine(adbPath, "reboot")
         }
     }
 }
