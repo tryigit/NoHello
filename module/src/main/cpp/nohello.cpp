@@ -1,4 +1,5 @@
 /* Copyright 2022-2023 John "topjohnwu" Wu
+ * Copyright 2024 The NoHello Contributors
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted.
@@ -17,6 +18,8 @@
 #include <fcntl.h>
 #include <android/log.h>
 #include <filesystem>
+#include <vector>
+#include <utility> // For std::pair, std::move
 
 #include "zygisk.hpp"
 #include "external/android_filesystem_config.h"
@@ -55,26 +58,26 @@ static bool anomaly(MountRootResolver mrs, const MountInfo &mount) {
 	const auto& fs_type = mount.getFsType();
 	const auto& mnt_src = mount.getMountSource();
 
-	if (toumount_sources.contains(mnt_src)) {
+	if (toumount_sources.count(mnt_src)) { // Use .count for std::set
 		return true;
 	}
 
 	if (fs_type == "overlay") {
-		if (toumount_sources.contains(mnt_src)) {
+		if (toumount_sources.count(mnt_src)) {
 			return true;
 		}
 		const auto& fm = mount.getMountOptions().flagmap;
-		if (fm.contains("lowerdir") && fm.at("lowerdir").starts_with(adb_path_prefix)) {
+		if (fm.count("lowerdir") && fm.at("lowerdir").starts_with(adb_path_prefix)) {
 			return true;
 		}
-		if (fm.contains("upperdir") && fm.at("upperdir").starts_with(adb_path_prefix)) {
+		if (fm.count("upperdir") && fm.at("upperdir").starts_with(adb_path_prefix)) {
 			return true;
 		}
-		if (fm.contains("workdir") && fm.at("workdir").starts_with(adb_path_prefix)) {
+		if (fm.count("workdir") && fm.at("workdir").starts_with(adb_path_prefix)) {
 			return true;
 		}
 	} else if (fs_type == "tmpfs") {
-		if (toumount_sources.contains(mnt_src)) {
+		if (toumount_sources.count(mnt_src)) {
 			return true;
 		}
 	}
@@ -120,14 +123,15 @@ static std::unique_ptr<std::string> getExternalErrorBehaviour(const MountInfo& m
 
 static void unmount(const std::vector<MountInfo>& mounts) {
 	MountRootResolver mrs(mounts);
-	for (auto mount = mounts.rbegin(); mount != mounts.rend(); mount++) {
-		if (anomaly(mrs, *mount)) {
+	for (auto mount_it = mounts.rbegin(); mount_it != mounts.rend(); ++mount_it) {
+        const auto& mount = *mount_it;
+		if (anomaly(mrs, mount)) {
 			errno = 0;
 			int res;
-			if ((res = umount2(mount->getMountPoint().c_str(), MNT_DETACH)) == 0)
-				LOGD("umount2(\"%s\", MNT_DETACH): returned (0): 0 (Success)", mount->getMountPoint().c_str());
+			if ((res = umount2(mount.getMountPoint().c_str(), MNT_DETACH)) == 0)
+				LOGD("umount2(\"%s\", MNT_DETACH): returned (0): 0 (Success)", mount.getMountPoint().c_str());
 			else
-				LOGE("umount2(\"%s\", MNT_DETACH): returned %d: %d (%s)", mount->getMountPoint().c_str(), res, errno, strerror(errno));
+				LOGE("umount2(\"%s\", MNT_DETACH): returned %d: %d (%s)", mount.getMountPoint().c_str(), res, errno, strerror(errno));
 		}
 	}
 }
@@ -137,7 +141,7 @@ static void remount(const std::vector<MountInfo>& mounts) {
 		if (mount.getMountPoint() == "/data") {
 			const auto& mntopts = mount.getMountOptions();
 			const auto& fm = mntopts.flagmap;
-			if (!fm.contains("errors"))
+			if (!fm.count("errors"))
 				break;
 			auto errors = getExternalErrorBehaviour(mount);
 			if (!errors || fm.at("errors") == *errors)
@@ -214,7 +218,7 @@ public:
 	}
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
-        //preSpecialize("system_server");
+        //preSpecialize("system_server"); // System server usually doesn't need this level of hiding
 		api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
@@ -225,8 +229,6 @@ private:
 	ino_t inode{};
 
     void preSpecialize(const char *process) {
-        // Demonstrate connecting to to companion process
-        // We ask the companion for a random number
 		unsigned int flags = api->getFlags();
 		if (flags & zygisk::StateFlag::PROCESS_GRANTED_ROOT) {
 			api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
@@ -234,57 +236,115 @@ private:
 		}
 		if (flags & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
 			pid_t pid = getpid();
-			int fd = api->connectCompanion();
-			api->exemptFd(fd);
+			int cfd = api->connectCompanion(); // Companion FD
+			api->exemptFd(cfd);
 			std::tie(dev, inode) = devinoby("libandroid_runtime.so");
 			api->pltHookRegister(dev, inode, "unshare", (void*) reshare, (void**) &ar_unshare);
 			api->pltHookRegister(dev, inode, "setresuid", (void*) resetresuid, (void**) &ar_setresuid);
 			api->pltHookCommit();
-			nocb = [pid, cfd = fd]() {
+			nocb = [pid, cfd, this]() { // Capture this for api access
 				nocb = []() {};
-				std::vector<std::unique_ptr<FileDescriptorInfo>> fdivec;
-				/*auto fds = GetOpenFds([](const std::string &error){
-					LOGE("[zygisk::PreSpecialize] GetOpenFds: %s", error.c_str());
-				});
-				for (auto &fd : *fds) {
-					auto fdi = FileDescriptorInfo::CreateFromFd(fd, [fd](const std::string &error){
-						LOGE("[zygisk::PreSpecialize] CreateFromFd(%d): %s", fd, error.c_str());
-					});
-					if (fdi && !fdi->is_sock && !fdi->file_path.starts_with("/memfd:"))
-						fdivec.emplace_back(std::move(fdi));
-				}*/
-				int res = ar_unshare(CLONE_NEWNS);
-				if (res != 0) {
+                std::vector<std::pair<std::unique_ptr<FileDescriptorInfo>, bool>> fd_sanitize_list; // bool is prefer_detach
+
+                auto fds = GetOpenFds([](const std::string &error){
+                    LOGE("[zygisk::PreSpecialize] GetOpenFds: %s", error.c_str());
+                });
+
+                if (fds) {
+                    for (auto &fd_num : *fds) {
+                        if (fd_num == cfd) continue; // Skip companion FD itself
+
+                        auto fdi = FileDescriptorInfo::CreateFromFd(fd_num, [fd_num](const std::string &error){
+                            LOGE("[zygisk::PreSpecialize] CreateFromFd(%d): %s", fd_num, error.c_str());
+                        });
+
+                        if (fdi) {
+                            bool should_sanitize_this_fd = false;
+                            bool prefer_detach = false; // True if content/path is sensitive, implies detach
+
+                            if (fdi->is_sock) {
+                                std::string socket_name;
+                                if (fdi->GetSocketName(&socket_name)) {
+                                    if (socket_name.find("magisk") != std::string::npos ||
+                                        socket_name.find("kernelsu") != std::string::npos || // For KernelSU daemon, common pattern
+                                        socket_name.find("ksud") != std::string::npos || // KernelSU daemon
+                                        socket_name.find("apatchd") != std::string::npos || // For APatch daemon, common pattern
+                                        socket_name.find("apd") != std::string::npos      // APatch daemon
+                                        ) {
+                                        LOGD("Marking sensitive socket FD %d (%s) for sanitization.", fd_num, socket_name.c_str());
+                                        should_sanitize_this_fd = true;
+                                        prefer_detach = true; // Sockets are always detached if sensitive
+                                    }
+                                }
+                            } else { // Not a socket
+                                if (!fdi->file_path.starts_with("/memfd:") &&
+                                    !fdi->file_path.starts_with("/dev/ashmem") && // Common, usually not root related
+                                    !fdi->file_path.starts_with("[anon_inode:") && // e.g., [anon_inode:sync_fence]
+                                    !fdi->file_path.empty() // Ensure path is not empty
+                                    ) {
+                                    
+                                    if (fdi->file_path.starts_with(adb_path_prefix) ||
+                                        fdi->file_path.find("magisk") != std::string::npos ||
+                                        fdi->file_path.find("kernelsu") != std::string::npos ||
+                                        fdi->file_path.find("apatch") != std::string::npos) {
+                                        LOGD("Marking sensitive file FD %d (%s) for sanitization.", fd_num, fdi->file_path.c_str());
+                                        should_sanitize_this_fd = true;
+                                        prefer_detach = true; // Sensitive files also detached
+                                    }
+                                }
+                            }
+
+                            if (should_sanitize_this_fd) {
+                                fd_sanitize_list.emplace_back(std::move(fdi), prefer_detach);
+                            }
+                        }
+                    }
+                }
+
+				int res_unshare = ar_unshare(CLONE_NEWNS);
+				if (res_unshare != 0) {
 					LOGE("[zygisk::PreSpecialize] ar_unshare: %s", strerror(errno));
-					return;
+                    // Fallback or error handling might be needed if unshare fails critically
 				}
-				res = mount("rootfs", "/", nullptr, MS_SLAVE | MS_REC, nullptr);
-				if (res != 0) {
-					LOGE("[zygisk::PreSpecialize] mount: %s", strerror(errno));
-					return;
+				int res_mount_slave = mount("rootfs", "/", nullptr, MS_SLAVE | MS_REC, nullptr);
+				if (res_mount_slave != 0) {
+					LOGE("[zygisk::PreSpecialize] mount slave: %s", strerror(errno));
+                    // Fallback or error handling
 				}
+
+				int companion_result = -1;
 				if (write(cfd, &pid, sizeof(pid)) != sizeof(pid)) {
-					LOGE("[zygisk::PreSpecialize] write: %s", strerror(errno));
-					return;
-				}
-				if (read(cfd, &res, sizeof(res)) != sizeof(res)) {
-					LOGE("[zygisk::PreSpecialize] read: %s", strerror(errno));
-					return;
-				}
+					LOGE("[zygisk::PreSpecialize] write to companion: %s", strerror(errno));
+				} else {
+                    if (read(cfd, &companion_result, sizeof(companion_result)) != sizeof(companion_result)) {
+                        LOGE("[zygisk::PreSpecialize] read from companion: %s", strerror(errno));
+                        companion_result = -1; // Ensure error state
+                    }
+                }
 				close(cfd);
-				if (res == MODULE_CONFLICT) {
-					mount(nullptr, "/", nullptr, MS_SHARED | MS_REC, nullptr);
-					return;
-				} else if (res == EXIT_FAILURE) {
-					LOGW("[zygisk::PreSpecialize]: Fallback to unmount in zygote process");
-					unmount(getMountInfo());
+
+				if (companion_result == MODULE_CONFLICT) {
+					mount(nullptr, "/", nullptr, MS_SHARED | MS_REC, nullptr); // Revert mount changes if conflict
+				} else if (companion_result == EXIT_FAILURE) {
+					LOGW("[zygisk::PreSpecialize]: Companion failed, fallback to unmount in zygote process");
+					unmount(getMountInfo()); // Unmount in current (zygote) namespace as fallback
 				}
-				/*for (auto &fdi : fdivec) {
-					//LOGD("Reopening FD %d with %s", fdi->fd, fdi->file_path.c_str());
-					fdi->ReopenOrDetach([fd = fdi->fd](const std::string &error){
-						LOGE("[zygisk::PreSpecialize] ReopenOrDetach(%d): %s", fd, error.c_str());
-					});
-				}*/
+
+                // Sanitize FDs after companion communication and potential mount changes
+                for (auto &pair_fdi_detach : fd_sanitize_list) {
+                    auto& fdi_ptr = pair_fdi_detach.first;
+                    bool should_detach = pair_fdi_detach.second;
+                    if (fdi_ptr) {
+                        LOGD("Sanitizing FD %d (path: %s, socket: %d), detach: %d", 
+                                fdi_ptr->fd, fdi_ptr->file_path.c_str(), fdi_ptr->is_sock, should_detach);
+                        fdi_ptr->ReopenOrDetach([
+                            fd = fdi_ptr->fd, 
+                            path = fdi_ptr->file_path // Capture path by value for lambda
+                        ](const std::string &error){
+                            LOGE("[zygisk::PreSpecialize] Sanitize FD %d (%s): %s", fd, path.c_str(), error.c_str());
+                        }, should_detach);
+                    }
+                }
 			};
 			return;
 		}
@@ -292,10 +352,15 @@ private:
     }
 
 	void postSpecialize(const char *process) {
-		if (ar_unshare)
+        // Unhook PLT hooks
+		if (ar_unshare) {
 			api->pltHookRegister(dev, inode, "unshare", (void*) ar_unshare, nullptr);
-		if (ar_setresuid)
+            ar_unshare = nullptr; // Clear pointer
+        }
+		if (ar_setresuid) {
 			api->pltHookRegister(dev, inode, "setresuid", (void*) ar_setresuid, nullptr);
+            ar_setresuid = nullptr; // Clear pointer
+        }
 		api->pltHookCommit();
 		api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
 	}
@@ -306,9 +371,23 @@ static void NoRoot(int fd) {
 	pid_t pid = -1;
 	static unsigned int sucrate = 0;
 	static const std::string description = [] {
-		std::ifstream f("/data/adb/modules/zygisk_nohello/description");
-		return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : "A Zygisk module to hide root.";
+		std::ifstream f("/data/adb/modules/zygisk_nohello/module.prop");
+        std::string desc_content;
+        if (f.is_open()) {
+            PropertyManager pm_temp("/data/adb/modules/zygisk_nohello/module.prop");
+            desc_content = pm_temp.getProp("description", "A Zygisk module to hide root.");
+        } else {
+            // Fallback if module.prop isn't readable yet, though it should be.
+            desc_content = "A Zygisk module to hide root.";
+        }
+        // Remove any existing status prefix like "[...emoji...] ..." before appending new status
+        size_t prefix_end = desc_content.find("] ");
+        if (prefix_end != std::string::npos) {
+            desc_content = desc_content.substr(prefix_end + 2);
+        }
+		return desc_content;
 	}();
+
 	static const bool compatbility = [] {
 		if (fs::exists("/data/adb/modules/zygisk_shamiko") && !fs::exists("/data/adb/modules/zygisk_shamiko/disable"))
 			return false;
@@ -316,23 +395,26 @@ static void NoRoot(int fd) {
 			return false;
 		return true;
 	}();
-	int result;
+	int result_status;
 	if (read(fd, &pid, sizeof(pid)) != sizeof(pid)) {
+        LOGE("[ps::Companion] Failed to read PID: %s", strerror(errno));
 		close(fd);
 		return;
 	}
+
 	PropertyManager pm("/data/adb/modules/zygisk_nohello/module.prop");
 	if (!compatbility) {
-		result = MODULE_CONFLICT;
+		result_status = MODULE_CONFLICT;
 		pm.setProp("description", "[" + emoji::emojize(":x: ") + "Incompatible environment] " + description);
-		goto skip;
+		goto skip_unmount;
 	}
-	result = forkcall(
+
+	result_status = forkcall(
 		[pid]()
 		{
-			int res = switchnsto(pid);
-			if (!res) {
-				LOGE("[ps::Companion] setns: %s", strerror(errno));
+			int res_setns = switchnsto(pid);
+			if (!res_setns) { // switchnsto returns true on success (0 from setns)
+				LOGE("[ps::Companion] setns failed for PID %d: %s", pid, strerror(errno));
 				return EXIT_FAILURE;
 			}
 			auto mounts = getMountInfo();
@@ -341,13 +423,17 @@ static void NoRoot(int fd) {
 			return EXIT_SUCCESS;
 		}
 	);
-	if (result == EXIT_SUCCESS) {
+
+	if (result_status == EXIT_SUCCESS) {
 		sucrate++;
 		pm.setProp("description", "[" + emoji::emojize(":yum: ") + "Nohello unmounted (" + std::to_string(sucrate) + ") time(s)] " + description);
-	}
-	skip:
-	if (write(fd, &result, sizeof(result)) != sizeof(result)) {
-		LOGE("[ps::Companion] write: %s", strerror(errno));
+	} else if (result_status == EXIT_FAILURE) {
+        pm.setProp("description", "[" + emoji::emojize(":face_with_thermometer: ") + "Unmount failed in companion] " + description);
+    }
+
+skip_unmount:
+	if (write(fd, &result_status, sizeof(result_status)) != sizeof(result_status)) {
+		LOGE("[ps::Companion] write result to zygote: %s", strerror(errno));
 	}
 	close(fd);
 }
