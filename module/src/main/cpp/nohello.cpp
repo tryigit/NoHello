@@ -43,31 +43,42 @@ static constexpr uint16_t EXT_MAGIC = 0xEF53;
 
 #define MODULE_CONFLICT  2
 
-static const std::set<std::string> toumount = {"KSU", "APatch", "magisk", "worker"};
-
+static const std::set<std::string> toumount_sources = {"KSU", "APatch", "magisk", "worker"};
+static const std::string adb_path_prefix = "/data/adb";
 
 static bool anomaly(MountRootResolver mrs, const MountInfo &mount) {
-	if (mrs.resolveRoot(mount).starts_with("/data/adb") || mount.getMountPoint().starts_with("/data/adb")) {
+	const std::string resolved_root = mrs.resolveRoot(mount);
+	if (resolved_root.starts_with(adb_path_prefix) || mount.getMountPoint().starts_with(adb_path_prefix)) {
 		return true;
 	}
-	const auto& fs = mount.getFsType();
-	if (fs == "overlay" || fs == "tmpfs") {
-		if (toumount.contains(mount.getMountSource())) {
+
+	const auto& fs_type = mount.getFsType();
+	const auto& mnt_src = mount.getMountSource();
+
+	if (toumount_sources.contains(mnt_src)) {
+		return true;
+	}
+
+	if (fs_type == "overlay") {
+		if (toumount_sources.contains(mnt_src)) {
 			return true;
 		}
-	}
-	if (fs == "overlay") {
 		const auto& fm = mount.getMountOptions().flagmap;
-		if (fm.contains("lowerdir") && fm.at("lowerdir").starts_with("/data/adb")) {
+		if (fm.contains("lowerdir") && fm.at("lowerdir").starts_with(adb_path_prefix)) {
 			return true;
 		}
-		if (fm.contains("upperdir") && fm.at("upperdir").starts_with("/data/adb")) {
+		if (fm.contains("upperdir") && fm.at("upperdir").starts_with(adb_path_prefix)) {
 			return true;
 		}
-		if (fm.contains("workdir") && fm.at("workdir").starts_with("/data/adb")) {
+		if (fm.contains("workdir") && fm.at("workdir").starts_with(adb_path_prefix)) {
+			return true;
+		}
+	} else if (fs_type == "tmpfs") {
+		if (toumount_sources.contains(mnt_src)) {
 			return true;
 		}
 	}
+
 	return false;
 }
 
