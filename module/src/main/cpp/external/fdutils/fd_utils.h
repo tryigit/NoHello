@@ -25,6 +25,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <functional>
 
 #include <dirent.h>
 #include <cinttypes>
@@ -44,15 +45,16 @@ public:
 	// Checks whether the file descriptor associated with this object refers to
 	// the same description.
 	bool RefersToSameFile() const;
-	// Returns the locally-bound name of the socket |fd|. Returns true
-	// iff. all of the following hold :
-	//
-	// - the socket's sa_family is AF_UNIX.
-	// - the length of the path is greater than zero (i.e, not an unnamed socket).
-	// - the first byte of the path isn't zero (i.e, not a socket with an abstract
-	//   address).
 	bool GetSocketName(std::string* result);
-	void ReopenOrDetach(fail_fn_t fail_fn) const;
+
+    // Reopens non-socket FDs or detaches socket FDs (to /dev/null).
+    // If prefer_detach_to_dev_null is true for non-sockets, they are also detached.
+	void ReopenOrDetach(fail_fn_t fail_fn, bool prefer_detach_to_dev_null) const;
+    
+    // Detaches the FD by redirecting it to /dev/null.
+    void Detach(fail_fn_t fail_fn) const;
+
+
 	const int fd;
 	const struct stat stat;
 	const std::string file_path;
@@ -67,7 +69,6 @@ private:
 	// Constructs for non-socket file descriptors.
 	FileDescriptorInfo(struct stat stat, const std::string& file_path, int fd, int open_flags,
 					   int fd_flags, int fs_flags, off_t offset);
-	void DetachSocket(fail_fn_t fail_fn) const;
 
 	FileDescriptorInfo(const FileDescriptorInfo&) = delete;
 	void operator=(const FileDescriptorInfo&) = delete;
