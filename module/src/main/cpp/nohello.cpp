@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <android/log.h>
+#include <filesystem>
 
 #include "zygisk.hpp"
 #include "external/android_filesystem_config.h"
@@ -33,10 +34,14 @@ using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 
+namespace fs = std::filesystem;
+
 static constexpr off_t EXT_SUPERBLOCK_OFFSET = 0x400;
 static constexpr off_t EXT_MAGIC_OFFSET = 0x38;
 static constexpr off_t EXT_ERRORS_OFFSET = 0x3C;
 static constexpr uint16_t EXT_MAGIC = 0xEF53;
+
+#define MODULE_CONFLICT  2
 
 static const std::set<std::string> toumount = {"KSU", "APatch", "magisk", "worker"};
 
@@ -256,7 +261,10 @@ private:
 					return;
 				}
 				close(cfd);
-				if (res != EXIT_SUCCESS) {
+				if (res == MODULE_CONFLICT) {
+					mount(nullptr, "/", nullptr, MS_SHARED | MS_REC, nullptr);
+					return;
+				} else if (res == EXIT_FAILURE) {
 					LOGW("[zygisk::PreSpecialize]: Fallback to unmount in zygote process");
 					unmount(getMountInfo());
 				}
@@ -290,12 +298,25 @@ static void NoRoot(int fd) {
 		std::ifstream f("/data/adb/modules/zygisk_nohello/description");
 		return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : "A Zygisk module to hide root.";
 	}();
+	static const bool compatbility = [] {
+		if (fs::exists("/data/adb/modules/zygisk_shamiko") && !fs::exists("/data/adb/modules/zygisk_shamiko/disable"))
+			return false;
+		if (fs::exists("/data/adb/modules/zygisk-assistant") && !fs::exists("/data/adb/modules/zygisk-assistant/disable"))
+			return false;
+		return true;
+	}();
+	int result;
 	if (read(fd, &pid, sizeof(pid)) != sizeof(pid)) {
 		close(fd);
 		return;
 	}
 	PropertyManager pm("/data/adb/modules/zygisk_nohello/module.prop");
-	int result = forkcall(
+	if (!compatbility) {
+		result = MODULE_CONFLICT;
+		pm.setProp("description", "[" + emoji::emojize(":x: ") + "Incompatible environment] " + description);
+		goto skip;
+	}
+	result = forkcall(
 		[pid]()
 		{
 			int res = switchnsto(pid);
@@ -311,8 +332,9 @@ static void NoRoot(int fd) {
 	);
 	if (result == EXIT_SUCCESS) {
 		sucrate++;
-		pm.setProp("description", "[" + emoji::emojize(":yum: ") + "Nohello unmounted (" + std::to_string(sucrate) + ") times !] " + description);
+		pm.setProp("description", "[" + emoji::emojize(":yum: ") + "Nohello unmounted (" + std::to_string(sucrate) + ") time(s)] " + description);
 	}
+	skip:
 	if (write(fd, &result, sizeof(result)) != sizeof(result)) {
 		LOGE("[ps::Companion] write: %s", strerror(errno));
 	}
