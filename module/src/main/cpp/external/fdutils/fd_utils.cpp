@@ -1,4 +1,3 @@
-
 /*
  * This file includes modifications derived from The Android Open Source Project,
  * which is licensed under the Apache License, Version 2.0 (the "License").
@@ -28,7 +27,11 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <cerrno> // For errno
+#include <cstring> // For strerror
 #include "stringprintf.cpp"
+#include "../log.h" // For LOGD
+
 static const char kFdPath[] = "/proc/self/fd";
 
 
@@ -61,7 +64,7 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
 	// This should never happen; the zygote should always have the right set
 	// of permissions required to stat all its open files.
 	if (TEMP_FAILURE_RETRY(fstat(fd, &f_stat)) == -1) {
-		fail_fn(android::base::StringPrintf("Unable to stat %d", fd));
+		fail_fn(android::base::StringPrintf("Unable to stat %d: %s", fd, strerror(errno)));
 		return {};
 	}
 	if (S_ISSOCK(f_stat.st_mode)) {
@@ -140,6 +143,7 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
 	return std::unique_ptr<FileDescriptorInfo>(
 			new FileDescriptorInfo(f_stat, file_path, fd, open_flags, fd_flags, fs_flags, offset));
 }
+
 bool FileDescriptorInfo::RefersToSameFile() const {
 	struct stat f_stat;
 	if (TEMP_FAILURE_RETRY(fstat(fd, &f_stat)) == -1) {
@@ -147,10 +151,41 @@ bool FileDescriptorInfo::RefersToSameFile() const {
 	}
 	return f_stat.st_ino == stat.st_ino && f_stat.st_dev == stat.st_dev;
 }
-void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
-	if (is_sock) {
-		return DetachSocket(fail_fn);
-	}
+
+void FileDescriptorInfo::Detach(fail_fn_t fail_fn) const {
+    const int dev_null_fd = TEMP_FAILURE_RETRY(open("/dev/null", O_RDWR | O_CLOEXEC));
+    if (dev_null_fd < 0) {
+        fail_fn(android::base::StringPrintf("Failed to open /dev/null: %s", strerror(errno)));
+        return;
+    }
+
+    if (TEMP_FAILURE_RETRY(dup3(dev_null_fd, fd, O_CLOEXEC)) == -1) {
+        fail_fn(android::base::StringPrintf("Failed dup3 on descriptor %d to /dev/null: %s",
+                                            fd,
+                                            strerror(errno)));
+        // close(dev_null_fd) should still be attempted
+    }
+
+    if (TEMP_FAILURE_RETRY(close(dev_null_fd)) == -1) {
+        fail_fn(android::base::StringPrintf("Failed close(/dev/null temp fd %d): %s", dev_null_fd, strerror(errno)));
+    }
+}
+
+void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn, bool prefer_detach_to_dev_null) const {
+    if (is_sock) {
+        // Sockets are always "detached" by replacing their FD with /dev/null.
+        LOGD("Detaching socket FD %d to /dev/null", fd);
+        return Detach(fail_fn);
+    }
+
+    // For non-sockets:
+    if (prefer_detach_to_dev_null) {
+        LOGD("Detaching non-socket FD %d (path: %s) to /dev/null due to preference.", fd, file_path.c_str());
+        return Detach(fail_fn);
+    }
+
+    // Original logic for reopening regular files if not detaching.
+    LOGD("Reopening non-socket FD %d (path: %s) normally.", fd, file_path.c_str());
 	// NOTE: This might happen if the file was unlinked after being opened.
 	// It's a common pattern in the case of temporary files and the like but
 	// we should not allow such usage from the zygote.
@@ -182,8 +217,9 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
 	}
 	if (offset != -1 && TEMP_FAILURE_RETRY(lseek64(new_fd, offset, SEEK_SET)) == -1) {
 		close(new_fd);
-		fail_fn(android::base::StringPrintf("Failed lseek64(%d, SEEK_SET) (%s): %s",
+		fail_fn(android::base::StringPrintf("Failed lseek64(%d, %jd, SEEK_SET) (%s): %s",
 											new_fd,
+                                            (intmax_t)offset,
 											file_path.c_str(),
 											strerror(errno)));
 		return;
@@ -192,8 +228,8 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
 	if (TEMP_FAILURE_RETRY(dup3(new_fd, fd, dup_flags)) == -1) {
 		close(new_fd);
 		fail_fn(android::base::StringPrintf("Failed dup3(%d, %d, %d) (%s): %s",
+											new_fd, // Corrected order: new_fd, fd
 											fd,
-											new_fd,
 											dup_flags,
 											file_path.c_str(),
 											strerror(errno)));
@@ -201,6 +237,7 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
 	}
 	close(new_fd);
 }
+
 FileDescriptorInfo::FileDescriptorInfo(int fd) :
 		fd(fd),
 		stat(),
@@ -222,6 +259,7 @@ FileDescriptorInfo::FileDescriptorInfo(struct stat stat, const std::string& file
 		offset(offset),
 		is_sock(false) {
 }
+
 bool FileDescriptorInfo::GetSocketName(std::string* result) {
 	sockaddr_storage ss;
 	sockaddr* addr = reinterpret_cast<sockaddr*>(&ss);
@@ -254,22 +292,7 @@ bool FileDescriptorInfo::GetSocketName(std::string* result) {
 	result->assign(unix_addr->sun_path, path_len);
 	return true;
 }
-void FileDescriptorInfo::DetachSocket(fail_fn_t fail_fn) const {
-	const int dev_null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
-	if (dev_null_fd < 0) {
-		fail_fn(std::string("Failed to open /dev/null: ").append(strerror(errno)));
-		return;
-	}
-	if (dup3(dev_null_fd, fd, O_CLOEXEC) == -1) {
-		fail_fn(android::base::StringPrintf("Failed dup3 on socket descriptor %d: %s",
-											fd,
-											strerror(errno)));
-		return;
-	}
-	if (close(dev_null_fd) == -1) {
-		fail_fn(android::base::StringPrintf("Failed close(%d): %s", dev_null_fd, strerror(errno)));
-	}
-}
+
 // TODO: Move the definitions here and eliminate the forward declarations. They
 // temporarily help making code reviews easier.
 static int ParseFd(dirent* dir_entry, int dir_fd);
@@ -280,6 +303,7 @@ std::unique_ptr<std::set<int>> GetOpenFds(fail_fn_t fail_fn) {
 		fail_fn(android::base::StringPrintf("Unable to open directory %s: %s",
 											kFdPath,
 											strerror(errno)));
+        return nullptr; // Return nullptr on error
 	}
 	auto result = std::make_unique<std::set<int>>();
 	int dir_fd = dirfd(proc_fd_dir);
@@ -294,7 +318,7 @@ std::unique_ptr<std::set<int>> GetOpenFds(fail_fn_t fail_fn) {
 	}
 	if (closedir(proc_fd_dir) == -1) {
 		fail_fn(android::base::StringPrintf("Unable to close directory: %s", strerror(errno)));
-	}
+        	}
 	return result;
 }
 
