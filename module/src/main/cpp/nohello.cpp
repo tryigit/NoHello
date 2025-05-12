@@ -294,7 +294,7 @@ static void NoRoot(int fd) {
 		close(fd);
 		return;
 	}
-	PropertyManager pm("/data/adb/modules/zygisk_nohello");
+	PropertyManager pm("/data/adb/modules/zygisk_nohello/module.prop");
 	int result = forkcall(
 		[pid]()
 		{
@@ -309,8 +309,9 @@ static void NoRoot(int fd) {
 			return EXIT_SUCCESS;
 		}
 	);
-	if (result) {
-		pm.setProp("description", "[" + emoji::emojize(" :yum: ") + "Nohello completed (" + std::to_string(sucrate) + ") requests ! ] " + description);
+	if (result == EXIT_SUCCESS) {
+		sucrate++;
+		pm.setProp("description", "[" + emoji::emojize(":yum: ") + "Nohello unmounted (" + std::to_string(sucrate) + ") times !] " + description);
 	}
 	if (write(fd, &result, sizeof(result)) != sizeof(result)) {
 		LOGE("[ps::Companion] write: %s", strerror(errno));

@@ -2,8 +2,9 @@
 #include "PropertyManager.h"
 #include <fstream>
 #include <sstream>
+#include <utility>
 
-PropertyManager::PropertyManager(const std::string& path) : filePath(path) {
+PropertyManager::PropertyManager(std::string path) : filePath(std::move(path)) {
 	load();
 }
 

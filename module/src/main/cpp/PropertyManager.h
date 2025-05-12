@@ -7,7 +7,7 @@
 
 class PropertyManager {
 public:
-	explicit PropertyManager(const std::string& path);
+	explicit PropertyManager(std::string  path);
 
 	std::string getProp(const std::string& key);
 	void setProp(const std::string& key, const std::string& value);
