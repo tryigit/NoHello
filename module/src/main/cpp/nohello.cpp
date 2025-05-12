@@ -232,7 +232,7 @@ private:
 			nocb = [pid, cfd = fd]() {
 				nocb = []() {};
 				std::vector<std::unique_ptr<FileDescriptorInfo>> fdivec;
-				auto fds = GetOpenFds([](const std::string &error){
+				/*auto fds = GetOpenFds([](const std::string &error){
 					LOGE("[zygisk::PreSpecialize] GetOpenFds: %s", error.c_str());
 				});
 				for (auto &fd : *fds) {
@@ -241,7 +241,7 @@ private:
 					});
 					if (fdi && !fdi->is_sock && !fdi->file_path.starts_with("/memfd:"))
 						fdivec.emplace_back(std::move(fdi));
-				}
+				}*/
 				int res = ar_unshare(CLONE_NEWNS);
 				if (res != 0) {
 					LOGE("[zygisk::PreSpecialize] ar_unshare: %s", strerror(errno));
@@ -268,12 +268,12 @@ private:
 					LOGW("[zygisk::PreSpecialize]: Fallback to unmount in zygote process");
 					unmount(getMountInfo());
 				}
-				for (auto &fdi : fdivec) {
+				/*for (auto &fdi : fdivec) {
 					//LOGD("Reopening FD %d with %s", fdi->fd, fdi->file_path.c_str());
 					fdi->ReopenOrDetach([fd = fdi->fd](const std::string &error){
 						LOGE("[zygisk::PreSpecialize] ReopenOrDetach(%d): %s", fd, error.c_str());
 					});
-				}
+				}*/
 			};
 			return;
 		}
