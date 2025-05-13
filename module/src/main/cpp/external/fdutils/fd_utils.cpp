@@ -30,7 +30,7 @@
 #include <cerrno> // For errno
 #include <cstring> // For strerror
 #include "stringprintf.cpp"
-#include "../log.h" // For LOGD
+#include "../../../log.h" // For LOGD
 
 static const char kFdPath[] = "/proc/self/fd";
 

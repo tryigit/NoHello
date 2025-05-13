@@ -12,9 +12,11 @@
 #include <tuple>
 #include <cstdint>
 #include <sys/mman.h>
+#include <link.h>
+#include <sys/stat.h>
 #include "log.h"
 
-std::pair<dev_t, ino_t> devinoby(const std::string& lib, bool useFind = false, unsigned int *ln = nullptr) {
+std::pair<dev_t, ino_t> devinobymap(const std::string& lib, bool useFind = false, unsigned int *ln = nullptr) {
 	std::ifstream maps("/proc/self/maps");
 	unsigned int index = 0;
 	std::string line;
@@ -47,6 +49,27 @@ std::pair<dev_t, ino_t> devinoby(const std::string& lib, bool useFind = false, u
 	if (ln)
 		*ln = -1;
 	return {dev_t(0), ino_t(0)};
+}
+
+std::optional<std::pair<dev_t, ino_t>> devinoby(const char* lib) {
+	struct State {
+		const char* needle;
+		std::optional<std::pair<dev_t, ino_t>> result;
+	} state = { lib };
+
+	dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+		auto* s = static_cast<State*>(data);
+		if (info->dlpi_name && strstr(info->dlpi_name, s->needle)) {
+			struct stat st{};
+			if (stat(info->dlpi_name, &st) == 0) {
+				s->result = std::make_pair(st.st_dev, st.st_ino);
+				return 1; // Stop iteration
+			}
+		}
+		return 0; // Continue
+	}, &state);
+
+	return state.result;
 }
 
 int forkcall(const std::function<int()> &lambda)

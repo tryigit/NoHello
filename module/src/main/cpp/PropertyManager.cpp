@@ -17,10 +17,11 @@ bool PropertyManager::loadFromFile() {
     }
 	std::string line;
 	while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue; // Skip empty lines and comments
+        if (line.empty() || line[0] == '#')
+			continue; // Skip empty lines and comments
 		auto pos = line.find('=');
-		if (pos == std::string::npos) continue;
-
+		if (pos == std::string::npos)
+			continue;
 		std::string key = line.substr(0, pos);
 		std::string val = line.substr(pos + 1);
 		props[key] = val;
