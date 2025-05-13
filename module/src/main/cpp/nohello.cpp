@@ -20,7 +20,7 @@
 #include <filesystem>
 #include <ranges>
 #include <vector>
-#include <utility> // For std::pair, std::move
+#include <utility>
 
 #include "zygisk.hpp"
 #include "external/android_filesystem_config.h"
@@ -87,20 +87,20 @@ static std::pair<bool, bool> anomaly(const std::unique_ptr<FileDescriptorInfo> f
 		std::string socket_name;
 		if (fdi->GetSocketName(&socket_name)) {
 			if (socket_name.find("magisk") != std::string::npos ||
-				socket_name.find("kernelsu") != std::string::npos || // For KernelSU daemon, common pattern
-				socket_name.find("ksud") != std::string::npos || // KernelSU daemon
-				socket_name.find("apatchd") != std::string::npos || // For APatch daemon, common pattern
-				socket_name.find("apd") != std::string::npos      // APatch daemon
+				socket_name.find("kernelsu") != std::string::npos ||
+				socket_name.find("ksud") != std::string::npos ||
+				socket_name.find("apatchd") != std::string::npos ||
+				socket_name.find("apd") != std::string::npos
 					) {
 				LOGD("Marking sensitive socket FD %d (%s) for sanitization.", fdi->fd, socket_name.c_str());
 				return {true, true};
 			}
 		}
-	} else { // Not a socket
+	} else {
 		if (!fdi->file_path.starts_with("/memfd:") &&
-			!fdi->file_path.starts_with("/dev/ashmem") && // Common, usually not root related
-			!fdi->file_path.starts_with("[anon_inode:") && // e.g., [anon_inode:sync_fence]
-			!fdi->file_path.empty() // Ensure path is not empty
+			!fdi->file_path.starts_with("/dev/ashmem") &&
+			!fdi->file_path.starts_with("[anon_inode:") &&
+			!fdi->file_path.empty()
 				) {
 			if (fdi->file_path.starts_with(adbPathPrefix) ||
 				fdi->file_path.find("magisk") != std::string::npos ||
@@ -233,7 +233,6 @@ public:
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
-        // Use JNI to fetch our process name
         const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
         preSpecialize(process);
         env->ReleaseStringUTFChars(args->nice_name, process);
@@ -246,7 +245,6 @@ public:
 	}
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
-        //preSpecialize("system_server"); // System server usually doesn't need this level of hiding
 		api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
@@ -265,13 +263,27 @@ private:
 		}
 		if (flags & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
 			pid_t pid = getpid();
-			cfd = api->connectCompanion(); // Companion FD
+			cfd = api->connectCompanion();
 			api->exemptFd(cfd);
 
-			LOGI("$[zygisk::PreSpecialize] Using dl_iterate_phdr (via devinoby) to find libandroid_runtime.so for PLT hooking.");
-			std::tie(dev, inode) = devinobymap("libandroid_runtime.so");
-			if (!dev && !inode) { // Check if devinobymap succeeded
-				LOGE("$[zygisk::PreSpecialize] devinobymap: Failed to get device & inode for libandroid_runtime.so from /proc/self/maps.");
+			auto di_optional = devinoby("libandroid_runtime.so");
+
+			if (di_optional) {
+				LOGI("$[zygisk::PreSpecialize] Using dl_iterate_phdr (via devinoby) to find libandroid_runtime.so for PLT hooking.");
+				std::tie(dev, inode) = *di_optional;
+			} else {
+				LOGW("$[zygisk::PreSpecialize] devinoby (dl_iterate_phdr) failed. Falling back to devinobymap (/proc/self/maps).");
+				std::tie(dev, inode) = devinobymap("libandroid_runtime.so");
+				if (!dev && !inode) {
+					LOGE("$[zygisk::PreSpecialize] devinobymap: Failed to get device & inode for libandroid_runtime.so from /proc/self/maps.");
+					close(cfd);
+					api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+					return;
+				}
+			}
+
+			if (!dev && !inode) {
+				LOGE("$[zygisk::PreSpecialize] Critical error: Could not obtain dev and inode for libandroid_runtime.so.");
 				close(cfd);
 				api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
 				return;
@@ -280,15 +292,15 @@ private:
 			api->pltHookRegister(dev, inode, "unshare", (void*) reshare, (void**) &ar_unshare);
 			api->pltHookRegister(dev, inode, "setresuid", (void*) resetresuid, (void**) &ar_setresuid);
 			api->pltHookCommit();
-			nocb = [pid, this]() { // Capture this for api access
+			nocb = [pid, this]() {
 				nocb = []() {};
-                std::vector<std::pair<std::unique_ptr<FileDescriptorInfo>, bool>> fdSanitizeList; // bool is shouldDetach
+                std::vector<std::pair<std::unique_ptr<FileDescriptorInfo>, bool>> fdSanitizeList;
                 auto fds = GetOpenFds([](const std::string &error){
                     LOGE("#[zygisk::PreSpecialize] GetOpenFds: %s", error.c_str());
                 });
                 if (fds) {
                     for (auto &fd : *fds) {
-                        if (fd == cfd) continue; // Skip companion FD itself
+                        if (fd == cfd) continue;
                         auto fdi = FileDescriptorInfo::CreateFromFd(fd, [fd](const std::string &error){
                             LOGE("#[zygisk::PreSpecialize] CreateFromFd(%d): %s", fd, error.c_str());
                         });
@@ -304,44 +316,40 @@ private:
 				int res = ar_unshare(CLONE_NEWNS);
 				if (res != 0) {
 					LOGE("#[zygisk::PreSpecialize] ar_unshare: %s", strerror(errno));
-					// There's nothing we can do except returning
 					close(cfd);
 					return;
 				}
 				res = mount("rootfs", "/", nullptr, MS_SLAVE | MS_REC, nullptr);
 				if (res != 0) {
 					LOGE("#[zygisk::PreSpecialize] mount(rootfs, \"/\", nullptr, MS_SLAVE | MS_REC, nullptr): returned %d: %d (%s)", res, errno, strerror(errno));
-                    // There's nothing we can do except returning
 					close(cfd);
 					return;
 				}
 
 				if (write(cfd, &pid, sizeof(pid)) != sizeof(pid)) {
 					LOGE("#[zygisk::PreSpecialize] write: [-> pid]: %s", strerror(errno));
-					res = EXIT_FAILURE; // Fallback to unmount from zygote
+					res = EXIT_FAILURE;
                 } else if (read(cfd, &res, sizeof(res)) != sizeof(res)) {
 					LOGE("#[zygisk::PreSpecialize] read: [<- status]: %s", strerror(errno));
-					res = EXIT_FAILURE; // Fallback to unmount from zygote
+					res = EXIT_FAILURE;
 				}
 
 				close(cfd);
 
 				if (res == MODULE_CONFLICT) {
-					// Revert mount changes if conflict
 					mount(nullptr, "/", nullptr, MS_SHARED | MS_REC, nullptr);
 					return;
 				} else if (res == EXIT_FAILURE) {
 					LOGW("#[zygisk::PreSpecialize]: Companion failed, fallback to unmount in zygote process");
-					unmount(getMountInfo()); // Unmount in current (zygote) namespace as fallback
+					unmount(getMountInfo());
 				}
 
-                // Sanitize FDs after companion communication and potential mount changes
                 for (auto &[fdi, shouldDetach] : fdSanitizeList) {
 					LOGD("#[zygisk::PreSpecialize]: Sanitizing FD %d (path: %s, socket: %d), detach: %d",
 							fdi->fd, fdi->file_path.c_str(), fdi->is_sock, shouldDetach);
 					fdi->ReopenOrDetach([
 						fd = fdi->fd,
-						path = fdi->file_path // Capture path by value for lambda
+						path = fdi->file_path
 					](const std::string &error){
 						LOGE("#[zygisk::PreSpecialize] Sanitize FD %d (%s): %s", fd, path.c_str(), error.c_str());
 					}, shouldDetach);
@@ -353,20 +361,15 @@ private:
     }
 
 	void postSpecialize(const char *process) {
-        // Unhook PLT hooks
 		if (ar_unshare) {
 			api->pltHookRegister(dev, inode, "unshare", (void*) ar_unshare, nullptr);
-            ar_unshare = nullptr; // Clear pointer
+            ar_unshare = nullptr;
         }
 		if (ar_setresuid) {
 			api->pltHookRegister(dev, inode, "setresuid", (void*) ar_setresuid, nullptr);
-            ar_setresuid = nullptr; // Clear pointer
+            ar_setresuid = nullptr;
         }
 		api->pltHookCommit();
-		// DO NOT UNCOMMENT THIS
-		// For some reasons it causes apps to loop infinitely after
-		// 2~3 executions
-		//close(cfd);
 		api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
 	}
 
@@ -377,9 +380,6 @@ static void NoRoot(int fd) {
 	static unsigned int successRate = 0;
 	static const std::string description = [] {
 		std::ifstream f("/data/adb/modules/zygisk_nohello/description");
-		// This file exists only after installing/updating the module
-		// It should have the default description
-		// Since this is static const it's only evaluated once per boot since companion won't exit
 		return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : "A Zygisk module to hide root.";
 	}();
 
@@ -406,7 +406,7 @@ static void NoRoot(int fd) {
 		[pid]()
 		{
 			int res = switchnsto(pid);
-			if (!res) { // switchnsto returns true on success (0 from setns)
+			if (!res) {
 				LOGE("#[ps::Companion] setns failed for PID %d: %s", pid, strerror(errno));
 				return EXIT_FAILURE;
 			}
@@ -428,6 +428,5 @@ static void NoRoot(int fd) {
 	close(fd);
 }
 
-// Register our module class and the companion handler function
 REGISTER_ZYGISK_MODULE(NoHello)
 REGISTER_ZYGISK_COMPANION(NoRoot)
