@@ -1,18 +1,3 @@
-/* Copyright 2022-2023 John "topjohnwu" Wu
- * Copyright 2024 The NoHello Contributors
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
- * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
- * AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
- * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
- * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
- * OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
- * PERFORMANCE OF THIS SOFTWARE.
- */
-
 #include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
@@ -21,22 +6,29 @@
 #include <ranges>
 #include <vector>
 #include <utility>
+#include <sys/mount.h>
+#include <endian.h>
+#include <thread>
+#include <fstream>
+#include <sstream>
+#include <sys/wait.h>
+#include <optional>
+#include <functional>
+#include <stdexcept>
+#include <cstring>
+#include <link.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 
 #include "zygisk.hpp"
 #include "external/android_filesystem_config.h"
 #include "mountsinfo.cpp"
-#include "utils.cpp"
 #include "external/fdutils/fd_utils.cpp"
-#include <sys/mount.h>
-#include <endian.h>
-#include <thread>
 #include "log.h"
 #include "PropertyManager.cpp"
 #include "external/emoji.h"
-
-using zygisk::Api;
-using zygisk::AppSpecializeArgs;
-using zygisk::ServerSpecializeArgs;
 
 namespace fs = std::filesystem;
 
@@ -49,6 +41,107 @@ static constexpr uint16_t EXT_MAGIC = 0xEF53;
 
 static const std::set<std::string> toumount_sources = {"KSU", "APatch", "magisk", "worker"};
 static const std::string adbPathPrefix = "/data/adb";
+
+std::pair<dev_t, ino_t> devinobymap(const std::string& lib, bool useFind = false, unsigned int *ln = nullptr) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    unsigned int index = 0;
+    std::string needle = "/" + lib;
+    if (!maps.is_open()) {
+        if (ln) *ln = static_cast<unsigned int>(-1);
+        return {dev_t(0), ino_t(0)};
+    }
+    while (std::getline(maps, line)) {
+        if (line.size() >= needle.size() && ((useFind && line.find(needle) != std::string::npos) ||
+            line.compare(line.size() - needle.size(), needle.size(), needle) == 0)) {
+            std::istringstream iss(line);
+            std::string addr, perms, offset, dev_str, inode_str;
+            iss >> addr >> perms >> offset >> dev_str >> inode_str;
+            std::istringstream devsplit(dev_str);
+            std::string major_hex, minor_hex;
+            if (std::getline(devsplit, major_hex, ':') &&
+                std::getline(devsplit, minor_hex)) {
+                try {
+                    int major = std::stoi(major_hex, nullptr, 16);
+                    int minor = std::stoi(minor_hex, nullptr, 16);
+                    dev_t devnum = makedev(major, minor);
+                    ino_t inode = std::stoul(inode_str);
+                    if (ln)
+                        *ln = index;
+                    maps.close();
+                    return {devnum, inode};
+                } catch (const std::invalid_argument& ia) {
+                } catch (const std::out_of_range& oor) {
+                }
+            }
+        }
+        index++;
+    }
+    maps.close();
+    if (ln)
+        *ln = static_cast<unsigned int>(-1);
+    return {dev_t(0), ino_t(0)};
+}
+
+std::optional<std::pair<dev_t, ino_t>> devinoby(const char* lib_name_needle) {
+    struct State {
+        const char* needle;
+        std::optional<std::pair<dev_t, ino_t>> result;
+    } state = { lib_name_needle, std::nullopt };
+
+    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+        auto* s = static_cast<State*>(data);
+        if (info->dlpi_name && info->dlpi_name[0]) {
+            const char* basename = strrchr(info->dlpi_name, '/');
+            if (basename) {
+                basename++;
+            } else {
+                basename = info->dlpi_name;
+            }
+            if (strcmp(basename, s->needle) == 0) {
+                struct stat st{};
+                if (stat(info->dlpi_name, &st) == 0) {
+                    s->result = std::make_pair(st.st_dev, st.st_ino);
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }, &state);
+    return state.result;
+}
+
+int forkcall(const std::function<int()>& lambda) {
+    pid_t pid = fork();
+    if (pid == -1)
+        return -1;
+    if (pid == 0) {
+        exit(lambda());
+    } else {
+        int status = -1;
+        if (waitpid(pid, &status, 0) == pid) {
+            if (WIFEXITED(status)) {
+                return WEXITSTATUS(status);
+            }
+        }
+    }
+    return -1;
+}
+
+bool switchnsto(pid_t pid) {
+    if (pid <= 0) return false;
+    std::string path = "/proc/" + std::to_string(pid) + "/ns/mnt";
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd != -1) {
+        int res = setns(fd, 0);
+        close(fd);
+        return res == 0;
+    } else {
+        LOGE("open(\"%s\"): %s", path.c_str(), strerror(errno));
+    }
+    return false;
+}
+
 
 static bool anomaly(MountRootResolver mrs, const MountInfo &mount) {
 	const std::string resolved_root = mrs.resolveRoot(mount);
@@ -125,14 +218,19 @@ static std::unique_ptr<std::string> getExternalErrorBehaviour(const MountInfo& m
 	uint16_t magic;
 	mntsrc.seekg(EXT_SUPERBLOCK_OFFSET + EXT_MAGIC_OFFSET, std::ios::beg);
 	mntsrc.read(reinterpret_cast<char *>(&magic), sizeof(magic));
-	if (!mntsrc || mntsrc.gcount() != sizeof(magic))
+	if (!mntsrc || mntsrc.gcount() != sizeof(magic)) {
+        mntsrc.close();
 		return nullptr;
+    }
 	magic = le16toh(magic);
-	if (magic != EXT_MAGIC)
+	if (magic != EXT_MAGIC) {
+        mntsrc.close();
 		return nullptr;
+    }
 	uint16_t errors;
 	mntsrc.seekg(EXT_SUPERBLOCK_OFFSET + EXT_ERRORS_OFFSET, std::ios::beg);
 	mntsrc.read(reinterpret_cast<char *>(&errors), sizeof(errors));
+    mntsrc.close();
 	if (!mntsrc || mntsrc.gcount() != sizeof(errors))
 		return nullptr;
 	errors = le16toh(errors);
@@ -223,7 +321,9 @@ static int resetresuid(uid_t ruid, uid_t euid, uid_t suid) {
 	return ar_setresuid(ruid, euid, suid);
 }
 
-
+using zygisk::Api;
+using zygisk::AppSpecializeArgs;
+using zygisk::ServerSpecializeArgs;
 
 class NoHello : public zygisk::ModuleBase {
 public:
@@ -299,16 +399,19 @@ private:
                     LOGE("#[zygisk::PreSpecialize] GetOpenFds: %s", error.c_str());
                 });
                 if (fds) {
-                    for (auto &fd : *fds) {
-                        if (fd == cfd) continue;
-                        auto fdi = FileDescriptorInfo::CreateFromFd(fd, [fd](const std::string &error){
-                            LOGE("#[zygisk::PreSpecialize] CreateFromFd(%d): %s", fd, error.c_str());
+                    for (auto &fd_val : *fds) {
+                        if (fd_val == cfd) continue;
+                        auto fdi = FileDescriptorInfo::CreateFromFd(fd_val, [fd_val](const std::string &error){
+                            LOGE("#[zygisk::PreSpecialize] CreateFromFd(%d): %s", fd_val, error.c_str());
                         });
 						if (!fdi)
 							continue;
-						auto [canSanitize, shouldDetach] = anomaly(std::move(fdi));
+                        
+                        std::unique_ptr<FileDescriptorInfo> fdi_moved = std::move(fdi);
+                        auto [canSanitize, shouldDetach] = anomaly(std::const_pointer_cast<FileDescriptorInfo>(fdi_moved));
+
                         if (canSanitize) {
-							fdSanitizeList.emplace_back(std::move(fdi), shouldDetach);
+							fdSanitizeList.emplace_back(std::move(fdi_moved), shouldDetach);
 						}
                     }
                 }
@@ -344,15 +447,17 @@ private:
 					unmount(getMountInfo());
 				}
 
-                for (auto &[fdi, shouldDetach] : fdSanitizeList) {
-					LOGD("#[zygisk::PreSpecialize]: Sanitizing FD %d (path: %s, socket: %d), detach: %d",
-							fdi->fd, fdi->file_path.c_str(), fdi->is_sock, shouldDetach);
-					fdi->ReopenOrDetach([
-						fd = fdi->fd,
-						path = fdi->file_path
-					](const std::string &error){
-						LOGE("#[zygisk::PreSpecialize] Sanitize FD %d (%s): %s", fd, path.c_str(), error.c_str());
-					}, shouldDetach);
+                for (auto &[fdi_entry, shouldDetach] : fdSanitizeList) {
+                    if (fdi_entry) {
+                        LOGD("#[zygisk::PreSpecialize]: Sanitizing FD %d (path: %s, socket: %d), detach: %d",
+                                fdi_entry->fd, fdi_entry->file_path.c_str(), fdi_entry->is_sock, shouldDetach);
+                        fdi_entry->ReopenOrDetach([
+                            fd_capture = fdi_entry->fd,
+                            path_capture = fdi_entry->file_path
+                        ](const std::string &error){
+                            LOGE("#[zygisk::PreSpecialize] Sanitize FD %d (%s): %s", fd_capture, path_capture.c_str(), error.c_str());
+                        }, shouldDetach);
+                    }
                 }
 			};
 			return;
