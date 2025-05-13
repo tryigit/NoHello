@@ -267,19 +267,14 @@ private:
 			pid_t pid = getpid();
 			cfd = api->connectCompanion(); // Companion FD
 			api->exemptFd(cfd);
-			auto di = devinoby("libandroid_runtime.so");
-			if (di) {
-				std::tie(dev, inode) = *di;
-			} else {
-				LOGW("$[zygisk::PreSpecialize] devino[dl_iterate_phdr]: Failed to get device & inode for libandroid_runtime.so");
-				LOGI("$[zygisk::PreSpecialize] Fallback to use `/proc/self/maps`");
-				std::tie(dev, inode) = devinobymap("libandroid_runtime.so");
-				if (!dev && !inode) {
-					LOGE("$[zygisk::PreSpecialize] devino[/proc/self/maps]: Failed to get device & inode for libandroid_runtime.so");
-					close(cfd);
-					api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-					return;
-				}
+
+			LOGI("$[zygisk::PreSpecialize] Using dl_iterate_phdr (via devinoby) to find libandroid_runtime.so for PLT hooking.");
+			std::tie(dev, inode) = devinobymap("libandroid_runtime.so");
+			if (!dev && !inode) { // Check if devinobymap succeeded
+				LOGE("$[zygisk::PreSpecialize] devinobymap: Failed to get device & inode for libandroid_runtime.so from /proc/self/maps.");
+				close(cfd);
+				api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+				return;
 			}
 
 			api->pltHookRegister(dev, inode, "unshare", (void*) reshare, (void**) &ar_unshare);
