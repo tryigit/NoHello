@@ -181,6 +181,13 @@ static void remount_data(const std::vector<MountInfo>& mounts) {
     }
 }
 
+// Forward declarations for hooked functions
+static FILE *hooked_fopen(const char *filename, const char *mode);
+static FILE *hooked_fopen64(const char *filename, const char *mode);
+static int hooked_unshare(int flags);
+static int hooked_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+static int hooked_setresgid(gid_t rgid, gid_t egid, gid_t sgid);
+
 class NoHello : public zygisk::ModuleBase {
 public:
     static std::function<void()> nocb_instance;
