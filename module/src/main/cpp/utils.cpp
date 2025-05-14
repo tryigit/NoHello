@@ -14,15 +14,6 @@
 #include <sys/mman.h>
 #include <link.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sched.h>
-#include <cstdlib>
-#include <optional>
-#include <functional>
-#include <cstring>
-#include <stdexcept>
-
 #include "log.h"
 
 std::pair<dev_t, ino_t> devinobymap(const std::string& lib, bool useFind = false, unsigned int *ln = nullptr) {
@@ -38,65 +29,50 @@ std::pair<dev_t, ino_t> devinobymap(const std::string& lib, bool useFind = false
 		if (line.size() >= needle.size() && ((useFind && line.find(needle) != std::string::npos) ||
 			line.compare(line.size() - needle.size(), needle.size(), needle) == 0)) {
 			std::istringstream iss(line);
-			std::string addr, perms, offset, dev_str, inode_str;
-			iss >> addr >> perms >> offset >> dev_str >> inode_str;
-			std::istringstream devsplit(dev_str);
+			std::string addr, perms, offset, dev, inode_str;
+			iss >> addr >> perms >> offset >> dev >> inode_str;
+			std::istringstream devsplit(dev);
 			std::string major_hex, minor_hex;
 			if (std::getline(devsplit, major_hex, ':') &&
 				std::getline(devsplit, minor_hex)) {
-				try {
-					int major = std::stoi(major_hex, nullptr, 16);
-					int minor = std::stoi(minor_hex, nullptr, 16);
-					dev_t devnum = makedev(major, minor);
-					ino_t inode = std::stoul(inode_str);
-					if (ln)
-						*ln = index;
-					return {devnum, inode};
-				} catch (const std::invalid_argument& ia) {
-                    
-				} catch (const std::out_of_range& oor) {
-                    
-                }
+				int major = std::stoi(major_hex, nullptr, 16);
+				int minor = std::stoi(minor_hex, nullptr, 16);
+				dev_t devnum = makedev(major, minor);
+				ino_t inode = std::stoul(inode_str);
+				if (ln)
+					*ln = index;
+				return {devnum, inode};
 			}
 		}
 		index++;
 	}
 	if (ln)
-		*ln = static_cast<unsigned int>(-1);
+		*ln = -1;
 	return {dev_t(0), ino_t(0)};
 }
 
-std::optional<std::pair<dev_t, ino_t>> devinoby(const char* lib_name_needle) {
+std::optional<std::pair<dev_t, ino_t>> devinoby(const char* lib) {
 	struct State {
 		const char* needle;
 		std::optional<std::pair<dev_t, ino_t>> result;
-	} state = { lib_name_needle, std::nullopt };
+	} state = { lib };
 
 	dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
 		auto* s = static_cast<State*>(data);
-		if (info->dlpi_name && info->dlpi_name[0]) {
-            const char* basename = strrchr(info->dlpi_name, '/');
-            if (basename) {
-                basename++;
-            } else {
-                basename = info->dlpi_name;
-            }
-
-			if (strcmp(basename, s->needle) == 0) {
-				struct stat st{};
-				if (stat(info->dlpi_name, &st) == 0) {
-					s->result = std::make_pair(st.st_dev, st.st_ino);
-					return 1;
-				}
+		if (info->dlpi_name && strstr(info->dlpi_name, s->needle)) {
+			struct stat st{};
+			if (stat(info->dlpi_name, &st) == 0) {
+				s->result = std::make_pair(st.st_dev, st.st_ino);
+				return 1; // Stop iteration
 			}
 		}
-		return 0;
+		return 0; // Continue
 	}, &state);
 
 	return state.result;
 }
 
-int forkcall(const std::function<int()>& lambda)
+int forkcall(const std::function<int()> &lambda)
 {
 	pid_t pid = fork();
 	if (pid == -1)
@@ -105,11 +81,10 @@ int forkcall(const std::function<int()>& lambda)
 		exit(lambda());
 	} else {
 		int status = -1;
-		if (waitpid(pid, &status, 0) == pid) {
-            if (WIFEXITED(status)) {
-                return WEXITSTATUS(status);
-            }
-        }
+		waitpid(pid, &status, 0);
+		if (WIFEXITED(status)) {
+			return WEXITSTATUS(status);
+		}
 	}
 	return -1;
 }
@@ -125,13 +100,17 @@ bool switchnsto(pid_t pid) {
 		int res = setns(fd, CLONE_NEWNS);
 		close(fd);
 		return res == 0;
+	} else {
+		LOGE("pidfd_open: %s", strerror(errno));
 	}
 	std::string path = "/proc/" + std::to_string(pid) + "/ns/mnt";
-	fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	fd = open(path.c_str(), O_RDONLY);
 	if (fd != -1) {
 		int res = setns(fd, 0);
 		close(fd);
 		return res == 0;
+	} else {
+		LOGE("open: %s", strerror(errno));
 	}
 	return false;
 }
